@@ -59,21 +59,23 @@ def _matrix_get(m, Py_ssize_t i, Py_ssize_t j):
 cdef class SandpileSeq:
     """Independent stochastic MPFR simulation with a retained n-by-n mu matrix.
 
-    `condition`: 'lovasz' or 'siegel' (as in uploaded sandpile.cpp):
-        Lovasz: delta*r[i] > r[i+1] + mu[i+1,i]**2 * r[i]
-        Siegel: delta*r[i] > r[i+1]
+    `condition`: 'lovasz' or 'siegel' in *fpylll's* convention:
+        Lovasz: delta*r[i] > r[i+1] + mu[i+1,i]**2*r[i]
+        Siegel: (delta - eta**2)*r[i] > r[i+1]
 
-    `delta`, `mubnd` are interpreted in the original program's convention.
+    `eta` is both the fpylll size-reduction bound and the width of the
+    *current* uniform sampler (alternative sampler is a future TODO).
     `run` can be called repeatedly. `snapshot()` exports full-precision strings.
     """
     cdef mpfr_t* _r
     cdef mpfr_t* _mu          # n*n matrix: row-major, including upper zeros
     cdef Py_ssize_t _n, _r_init, _mu_init
     cdef long _prec
-    cdef mpfr_t _delta, _bound, _half, _lhs, _rhs, _tmp, _old_r, _new_r
+    cdef mpfr_t _delta, _eta, _siegel_coeff, _half, _lhs, _rhs, _tmp, _old_r, _new_r
     cdef bint _scalar_init, _rng_init, _siegel
     cdef gmp_randstate_t _rng
     cdef public unsigned long long swaps, tests
+    cdef object _valid_swap_mu
 
     def __cinit__(self):
         self._r = NULL
@@ -84,6 +86,7 @@ cdef class SandpileSeq:
         self._scalar_init = False
         self._rng_init = False
         self.swaps = self.tests = 0
+        self._valid_swap_mu = []
 
     def __dealloc__(self):
         cdef Py_ssize_t j
@@ -97,7 +100,8 @@ cdef class SandpileSeq:
             free(self._mu)
         if self._scalar_init:
             mpfr_clear(self._delta)
-            mpfr_clear(self._bound)
+            mpfr_clear(self._eta)
+            mpfr_clear(self._siegel_coeff)
             mpfr_clear(self._half)
             mpfr_clear(self._lhs)
             mpfr_clear(self._rhs)
@@ -107,8 +111,8 @@ cdef class SandpileSeq:
         if self._rng_init:
             gmp_randclear(self._rng)
 
-    def __init__(self, source, *, condition='lovasz', delta='0.749',
-                 mubnd='0.5001', precision=None, seed=42,
+    def __init__(self, source, *, condition='lovasz', delta=0.99,
+                 eta=0.51, precision=None, seed=42,
                  allow_lossy_gso=True):
         """`source` is either an MPFR MatGSO or `(profile, full_mu_matrix)`.
 
@@ -171,7 +175,8 @@ cdef class SandpileSeq:
             self._mu_init += 1
             mpfr_set_ui(self._mu[i], 0, MPFR_RNDN)
         mpfr_init2(self._delta, self._prec)
-        mpfr_init2(self._bound, self._prec)
+        mpfr_init2(self._eta, self._prec)
+        mpfr_init2(self._siegel_coeff, self._prec)
         mpfr_init2(self._half, self._prec)
         mpfr_init2(self._lhs, self._prec)
         mpfr_init2(self._rhs, self._prec)
@@ -180,11 +185,15 @@ cdef class SandpileSeq:
         mpfr_init2(self._new_r, self._prec)
         self._scalar_init = True
         self._parse(self._delta, delta)
-        self._parse(self._bound, mubnd)
-        if mpfr_cmp_ui(self._delta, 0) <= 0 or mpfr_cmp_ui(self._delta, 1) >= 0:
-            raise ValueError('delta must be between 0 and 1')
-        if mpfr_cmp_ui(self._bound, 0) < 0:
-            raise ValueError('mubnd must be nonnegative')
+        self._parse(self._eta, eta)
+        if mpfr_cmp_ui(self._delta, 0) <= 0 or mpfr_cmp_ui(self._delta, 1) > 0:
+            raise ValueError('delta must be in (0, 1]')
+        if mpfr_cmp_ui(self._eta, 0) <= 0:
+            raise ValueError('eta must be positive')
+        mpfr_sqr(self._tmp, self._eta, MPFR_RNDN)
+        mpfr_sub(self._siegel_coeff, self._delta, self._tmp, MPFR_RNDN)
+        if mpfr_cmp_ui(self._siegel_coeff, 0) <= 0:
+            raise ValueError('eta**2 must be smaller than delta')
         mpfr_set_ui(self._half, 1, MPFR_RNDN)
         mpfr_div_ui(self._half, self._half, 2, MPFR_RNDN)
         gmp_randinit_default(self._rng)
@@ -269,23 +278,24 @@ cdef class SandpileSeq:
                 mpfr_set_d(self._mu[i*n+j], d, MPFR_RNDN)
 
     cdef void _sample_subdiag(self, Py_ssize_t i) noexcept:
-        """Uniform (-mubnd, mubnd), sampled in native MPFR precision."""
+        """Uniform (-eta, eta), sampled in native MPFR precision."""
         cdef mpfr_t* x = &self._mu[(i+1)*self._n+i]
         mpfr_urandomb(x[0], self._rng)
         mpfr_sub(x[0], x[0], self._half, MPFR_RNDN)
-        mpfr_mul(x[0], x[0], self._bound, MPFR_RNDN)
+        mpfr_mul(x[0], x[0], self._eta, MPFR_RNDN)
         mpfr_mul_ui(x[0], x[0], 2, MPFR_RNDN)
 
-    def run(self, unsigned long long max_swaps=2**33):
+    def run(self, unsigned long long max_swaps=1000000):
         """Execute sequential sweep to termination (or max_swaps), in place."""
         cdef Py_ssize_t i = 0
         cdef Py_ssize_t n = self._n
         while i < n-1:
             self.tests += 1
-            mpfr_mul(self._lhs, self._delta, self._r[i], MPFR_RNDN)
             if self._siegel:
+                mpfr_mul(self._lhs, self._siegel_coeff, self._r[i], MPFR_RNDN)
                 mpfr_set(self._rhs, self._r[i+1], MPFR_RNDN)
             else:
+                mpfr_mul(self._lhs, self._delta, self._r[i], MPFR_RNDN)
                 mpfr_sqr(self._tmp, self._mu[(i+1)*n+i], MPFR_RNDN)
                 mpfr_mul(self._rhs, self._tmp, self._r[i], MPFR_RNDN)
                 mpfr_add(self._rhs, self._rhs, self._r[i+1], MPFR_RNDN)
@@ -294,6 +304,11 @@ cdef class SandpileSeq:
                 continue
             if self.swaps >= max_swaps:
                 raise RuntimeError(f'max_swaps={max_swaps} reached; state preserved')
+
+            # Collect the size-reduced mu IMMEDIATELY before a valid swap.
+            # TODO: replace uniform re-sampling with a distribution conditional
+            # on the event that the subsequent swap is valid (user-requested).
+            self._valid_swap_mu.append(_decimal(self._mu[(i+1)*n+i]))
 
             # Exact same algebra as Sandpile_Model_Seq in uploaded C++:
             #   temp = r[i+1]
@@ -343,6 +358,15 @@ cdef class SandpileSeq:
         return [[_decimal(self._mu[i*n+j]) for j in range(n)]
                 for i in range(n)]
 
+    def valid_swap_mu(self):
+        """All subdiagonal mu values at successful swap decisions."""
+        return list(self._valid_swap_mu)
+
+    def final_subdiagonal_mu(self):
+        """All mu[i+1,i] at the current state, in MPFR decimal strings."""
+        cdef Py_ssize_t i, n = self._n
+        return [_decimal(self._mu[(i+1)*n+i]) for i in range(n-1)]
+
     def snapshot(self):
         return {
             'r': self.profile(),
@@ -351,4 +375,75 @@ cdef class SandpileSeq:
             'condition': self.condition,
             'swaps': int(self.swaps),
             'tests': int(self.tests),
+            'valid_swap_mu': self.valid_swap_mu(),
+            'final_subdiagonal_mu': self.final_subdiagonal_mu(),
         }
+
+
+def gso_mu_entry(MatGSO M, Py_ssize_t i, Py_ssize_t j):
+    """Read a single live GSO mu(i,j) without binary64 conversion (MPFR backend).
+
+    Caller must ensure the row is up to date, e.g. M.update_gso_row(i,i).
+    Intended for instrumented pre-swap logging.
+    """
+    cdef FP_NR[mpfr_t] t
+    if not (0 <= j < i < M.B.nrows):
+        raise IndexError('require 0 <= j < i < n')
+    if M._type == mat_gso_mpz_mpfr:
+        M._core.mpz_mpfr.get_mu(t, <int>i, <int>j)
+        return _decimal(t.get_data())
+    if M._type == mat_gso_long_mpfr:
+        M._core.long_mpfr.get_mu(t, <int>i, <int>j)
+        return _decimal(t.get_data())
+    return repr(M.get_mu(i, j))  # fallback (only for non-MPFR GSO)
+
+
+def gso_swap_is_valid(MatGSO M, Py_ssize_t k, double delta, double eta,
+                      bint siegel=False):
+    """Evaluate the fpylll-style adjacent test with native MPFR GSO values.
+
+    No get_d(), no binary64 GSO conversion. delta and eta are binary64 values
+    because that is fpylll.LLL.Reduction's public parameter ABI.
+    The caller must keep the relevant GSO rows up to date.
+    """
+    cdef FP_NR[mpfr_t] prev_r, curr_r, mu
+    cdef mpfr_t d, e, lhs, rhs, tmp
+    cdef long prec
+    from fpylll import FPLLL
+    if k <= 0 or k >= M.B.nrows:
+        raise IndexError('swap index k must satisfy 0 < k < n')
+    if M._type == mat_gso_mpz_mpfr:
+        M._core.mpz_mpfr.get_r(prev_r, <int>(k-1), <int>(k-1))
+        M._core.mpz_mpfr.get_r(curr_r, <int>k, <int>k)
+        M._core.mpz_mpfr.get_mu(mu, <int>k, <int>(k-1))
+    elif M._type == mat_gso_long_mpfr:
+        M._core.long_mpfr.get_r(prev_r, <int>(k-1), <int>(k-1))
+        M._core.long_mpfr.get_r(curr_r, <int>k, <int>k)
+        M._core.long_mpfr.get_mu(mu, <int>k, <int>(k-1))
+    else:
+        raise TypeError('gso_swap_is_valid requires float_type="mpfr"')
+    prec = int(FPLLL.get_precision('mpfr'))
+    mpfr_init2(d, prec)
+    mpfr_init2(e, prec)
+    mpfr_init2(lhs, prec)
+    mpfr_init2(rhs, prec)
+    mpfr_init2(tmp, prec)
+    try:
+        mpfr_set_d(d, delta, MPFR_RNDN)
+        mpfr_set_d(e, eta, MPFR_RNDN)
+        if siegel:
+            mpfr_sqr(tmp, e, MPFR_RNDN)
+            mpfr_sub(d, d, tmp, MPFR_RNDN)
+            mpfr_mul(lhs, d, prev_r.get_data(), MPFR_RNDN)
+            return mpfr_cmp(lhs, curr_r.get_data()) > 0
+        mpfr_mul(lhs, d, prev_r.get_data(), MPFR_RNDN)
+        mpfr_sqr(tmp, mu.get_data(), MPFR_RNDN)
+        mpfr_mul(rhs, tmp, prev_r.get_data(), MPFR_RNDN)
+        mpfr_add(rhs, rhs, curr_r.get_data(), MPFR_RNDN)
+        return mpfr_cmp(lhs, rhs) > 0
+    finally:
+        mpfr_clear(d)
+        mpfr_clear(e)
+        mpfr_clear(lhs)
+        mpfr_clear(rhs)
+        mpfr_clear(tmp)

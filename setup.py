@@ -87,7 +87,7 @@ ext = Extension(
 
 setup(
     name='sandpile-mpfr-bridge',
-    version='0.2.1',
+    version='0.3.0',
     ext_modules=cythonize(
         [ext],
         include_path=[include_overlay, str(fpylll_root)],

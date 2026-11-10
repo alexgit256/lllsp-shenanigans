@@ -1,0 +1,8 @@
+build/
+__pycache__/
+*.so
+*.pyd
+sandpile_mpfr.cpp
+fpylll-0.6.4/
+results/
+benchmark_results/
