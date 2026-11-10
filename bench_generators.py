@@ -137,6 +137,13 @@ def generate_one(family, spec, seed):
         raise ValueError(f'unknown lattice family {family!r}')
     return B, meta
 
+def matrix_shape(B):
+    nrows = B.nrows
+    ncols = B.ncols
+    return (
+        nrows() if callable(nrows) else nrows,
+        ncols() if callable(ncols) else ncols,
+    )
 
 def generate_instances(config, root, overwrite=False):
     """Generate ALL instances in this process; reduction jobs run separately."""
@@ -166,7 +173,7 @@ def generate_instances(config, root, overwrite=False):
                 instances.append({'id': instance_id, 'family': family,
                                   'variant': variant, 'spec': spec,
                                   'seed': seed, 'file': rel_path})
-                print(f'[generate] {instance_id}: {B.nrows}x{B.ncols}', flush=True)
+                print(f'[generate] {instance_id}: {matrix_shape(B)}', flush=True)
     manifest = {'schema': 1, 'config': config, 'instances': instances}
     manifest_file.write_text(json.dumps(manifest, indent=2), encoding='utf-8')
     return manifest

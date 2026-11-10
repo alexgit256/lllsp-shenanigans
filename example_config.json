@@ -2,15 +2,15 @@
   "seed": 42,
   "delta": 0.99,
   "eta": 0.51,
-  "precision": 212,
+  "precision": 103,
   "max_swaps": 1000000,
-  "n_workers": 4,
-  "simulation_seeds_per_lattice": 3,
+  "n_workers": 8,
+  "simulation_seeds_per_lattice": 5,
   "trace_real_swaps": true,
   "families": {
-    "ntru": [{"count": 3, "degree": 16, "q": 1153, "sigma": 1.0}],
-    "qary": [{"count": 3, "dimension": 32, "bits": 14, "k": 16}],
-    "intrel": [{"count": 3, "dimension": 32, "bits": 14}],
-    "coppersmith": [{"count": 3, "degree": 2, "m": 4, "t": 2, "modulus_bits": 32, "X": 8}]
+    "ntru": [{"count": 20, "degree": 128, "q": 8192, "sigma": 20.0}],
+    "qary": [{"count": 20, "dimension": 128, "bits": 13, "k": 64}],
+    "intrel": [{"count": 20, "dimension": 64, "bits": 31}],
+    "coppersmith": [{"count": 5, "degree": 2, "m": 4, "t": 2, "modulus_bits": 32, "X": 8}]
   }
 }
