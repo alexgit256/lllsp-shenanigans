@@ -276,7 +276,7 @@ cdef class SandpileSeq:
         mpfr_mul(x[0], x[0], self._bound, MPFR_RNDN)
         mpfr_mul_ui(x[0], x[0], 2, MPFR_RNDN)
 
-    def run(self, unsigned long long max_swaps=1000000):
+    def run(self, unsigned long long max_swaps=2**33):
         """Execute sequential sweep to termination (or max_swaps), in place."""
         cdef Py_ssize_t i = 0
         cdef Py_ssize_t n = self._n

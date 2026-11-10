@@ -20,6 +20,13 @@ If your Sage kernel is at a custom path, run its Python instead of a system Pyth
 
 **Validation status:** code is written against the published fpylll 0.6.x Cython declarations, but this container does not have fpylll/fplll/MPFR headers. Therefore it could not be compiled here; run `test_sandpile_mpfr.py` in your actual Sage environment. This is a source package, not a prebuilt `.so`.
 
+## Rebuilding
+
+```bash
+FPYLLL_SOURCE="$(realpath ./fpylll-0.6.4/src)" \
+python setup.py build_ext --inplace --force
+```
+
 ## A. Two simulations from the same fpylll `GSO.Mat`
 
 ```python
