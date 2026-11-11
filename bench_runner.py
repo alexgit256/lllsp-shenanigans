@@ -146,7 +146,13 @@ def _trace_before_swaps(B0, condition, prec, delta, eta, max_swaps):
             if swaps >= max_swaps:
                 raise RuntimeError(f'trace exceeded max_swaps={max_swaps}')
             valid_mu.append(gso_mu_entry(M, k, k-1))
-            M.swap_rows(k-1, k)
+            # Adjacent permutation with GSO cache invalidation.
+            # M.swap_rows() changes basis rows without invalidating cached
+            # Gram--Schmidt coefficients.  Using it here can make the Lovasz
+            # predicate repeatedly test stale values and hit max_swaps.
+            # For adjacent rows, move_row(k, k-1) is the same permutation,
+            # but fplll invalidates all affected GSO data correctly.
+            M.move_row(k, k-1)
             swaps += 1
             k = max(1, k-1)
         else:
