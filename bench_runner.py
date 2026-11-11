@@ -134,6 +134,10 @@ def _trace_before_swaps(B0, condition, prec, delta, eta, max_swaps):
     while k < B.nrows:
         # fpylll computes the Babai size reduction of row k, not Python
         # floating point rounding and not a standalone custom GSO routine.
+        if not M.update_gso_row(k-1, k-1):
+            raise ArithmeticError(
+                f"Predecessor GSO update failed at k={k}"
+            )
         L.size_reduction(k, k+1, 0)
         if not M.update_gso_row(k-1, k-1):
             raise ArithmeticError(f'GSO row {k-1} update failed')
