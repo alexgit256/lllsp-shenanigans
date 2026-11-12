@@ -204,7 +204,7 @@ def _run_one(payload):
         prec = int(cfg.get('precision', 212))
         delta = float(cfg.get('delta', 0.99))
         eta = float(cfg.get('eta', 0.51))
-        max_swaps = int(cfg.get('max_swaps', 1000000))
+        max_swaps = int(cfg.get('max_swaps', 0x400000000))
         n_sims = int(cfg.get('simulation_seeds_per_lattice', 3))
         if n_sims < 1:
             raise ValueError('simulation_seeds_per_lattice must be positive')

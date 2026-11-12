@@ -17,6 +17,8 @@ for computing previously uncomputed GSO coefficients with update_gso().
 
 from libc.stdlib cimport malloc, free
 from libc.stddef cimport size_t
+from libc.stdint cimport uint64_t
+from libc.math cimport isfinite
 
 from fpylll.fplll.gso cimport MatGSO
 from fpylll.fplll.decl cimport mat_gso_mpz_mpfr, mat_gso_long_mpfr
@@ -67,6 +69,12 @@ cdef class SandpileSeq:
     *current* uniform sampler (alternative sampler is a future TODO).
     `run` can be called repeatedly. `snapshot()` exports full-precision strings.
     """
+    cdef double* _rd
+    cdef double* _mud
+    cdef double _ddelta, _deta, _dsiegel_coeff
+    cdef uint64_t _rng64
+    cdef object _fptype
+    cdef bint _trace_swaps
     cdef mpfr_t* _r
     cdef mpfr_t* _mu          # n*n matrix: row-major, including upper zeros
     cdef Py_ssize_t _n, _r_init, _mu_init
@@ -78,6 +86,11 @@ cdef class SandpileSeq:
     cdef object _valid_swap_mu
 
     def __cinit__(self):
+        self._rd = NULL
+        self._mud = NULL
+        self._fptype = 'mpfr'
+        self._trace_swaps = False
+        self._rng64 = 0
         self._r = NULL
         self._mu = NULL
         self._n = 0
@@ -91,6 +104,10 @@ cdef class SandpileSeq:
 
     def __dealloc__(self):
         cdef Py_ssize_t j
+        if self._rd != NULL:
+            free(self._rd)
+        if self._mud != NULL:
+            free(self._mud)
         if self._r != NULL:
             for j in range(self._r_init):
                 mpfr_clear(self._r[j])
@@ -114,7 +131,7 @@ cdef class SandpileSeq:
 
     def __init__(self, source, *, condition='lovasz', delta=0.99,
                  eta=0.51, precision=None, seed=42,
-                 allow_lossy_gso=True):
+                 allow_lossy_gso=True, fptype='mpfr', trace_swaps=False):
         """`source` is either an MPFR MatGSO or `(profile, full_mu_matrix)`.
 
         `profile[i]` must contain SQUARED GS lengths. Full mu matrix entries
@@ -131,6 +148,17 @@ cdef class SandpileSeq:
         if condition not in ('lovasz', 'siegel'):
             raise ValueError("condition must be 'lovasz' or 'siegel'")
         self._siegel = condition == 'siegel'
+        if fptype not in ('double', 'dd', 'mpfr'):
+            raise ValueError("fptype must be 'double', 'dd', or 'mpfr'")
+        self._fptype = fptype
+        self._trace_swaps = bool(trace_swaps)
+        if fptype == 'dd':
+            raise NotImplementedError('dd backend is reserved, not implemented')
+        # A native-double instance does not allocate MPFR arrays or initialize
+        # MPFR temporaries. precision is deliberately ignored for non-MPFR.
+        if fptype == 'double':
+            self._init_double(source, delta, eta, seed, allow_lossy_gso)
+            return
         if from_gso:
             direct_mpfr = ((<MatGSO>source)._type == mat_gso_mpz_mpfr or
                            (<MatGSO>source)._type == mat_gso_long_mpfr)
@@ -214,6 +242,121 @@ cdef class SandpileSeq:
         for i in range(n*n):
             if not mpfr_number_p(self._mu[i]):
                 raise ArithmeticError(f'nonfinite mu matrix entry at {i//n}, {i%n}')
+
+    cdef void _init_double(self, object source, object delta, object eta,
+                           object seed, bint allow_lossy_gso) except *:
+        cdef Py_ssize_t n, i, j
+        cdef double x
+        cdef bint from_gso = isinstance(source, MatGSO)
+        if from_gso:
+            n = (<MatGSO>source).B.nrows
+            # Double is an intentionally lossy target for MPFR or dd GSO.
+            if not allow_lossy_gso and ((<MatGSO>source)._type == mat_gso_mpz_mpfr or
+                                        (<MatGSO>source)._type == mat_gso_long_mpfr):
+                raise TypeError('MPFR GSO to double requires allow_lossy_gso=True')
+        else:
+            if not isinstance(source, (tuple, list)) or len(source) != 2:
+                raise TypeError('source must be GSO.Mat or (squared_profile, full_mu_matrix)')
+            n = len(source[0])
+        if n < 2:
+            raise ValueError('dimension must be >= 2')
+        if int(seed) < 0:
+            raise ValueError('seed must be >= 0')
+        self._n = n
+        self._prec = 53
+        self._ddelta = float(delta)
+        self._deta = float(eta)
+        if not isfinite(self._ddelta) or not (0.0 < self._ddelta <= 1.0):
+            raise ValueError('delta must be in (0, 1]')
+        if not isfinite(self._deta) or not (self._deta > 0.0):
+            raise ValueError('eta must be positive')
+        self._dsiegel_coeff = self._ddelta - self._deta*self._deta
+        if not (self._dsiegel_coeff > 0.0):
+            raise ValueError('eta**2 must be smaller than delta')
+        # Same distribution as MPFR: U(-eta,eta), with an independent
+        # native 64-bit PRNG. Mask to uint64 so arbitrary Python seeds work.
+        self._rng64 = <uint64_t>(int(seed) & 0xffffffffffffffff)
+        if self._rng64 == 0:
+            self._rng64 = <uint64_t>0x9e3779b97f4a7c15
+        self._rd = <double*>malloc(n*sizeof(double))
+        self._mud = <double*>malloc(n*n*sizeof(double))
+        if self._rd == NULL or self._mud == NULL:
+            raise MemoryError()
+        for i in range(n*n):
+            self._mud[i] = 0.0
+        if from_gso:
+            if not (<MatGSO>source).update_gso():
+                raise ArithmeticError('MatGSO.update_gso() failed')
+            for i in range(n):
+                self._rd[i] = (<MatGSO>source).get_r(i,i)
+                for j in range(i):
+                    self._mud[i*n+j] = (<MatGSO>source).get_mu(i,j)
+        else:
+            for i in range(n):
+                self._rd[i] = float(source[0][i])
+            if source[1] is not None:
+                for i in range(1,n):
+                    for j in range(i):
+                        self._mud[i*n+j] = float(_matrix_get(source[1],i,j))
+        for i in range(n):
+            if not isfinite(self._rd[i]) or not (self._rd[i] > 0.0):
+                raise ArithmeticError(f'nonpositive or nonfinite squared GSO norm at {i}')
+        for i in range(n*n):
+            if not isfinite(self._mud[i]):
+                raise ArithmeticError(f'nonfinite mu matrix entry at {i//n}, {i%n}')
+
+    cdef inline uint64_t _next64(self) noexcept:
+        # xorshift64*, 64-bit unsigned overflow is defined.
+        cdef uint64_t x = self._rng64
+        x ^= x >> 12
+        x ^= x << 25
+        x ^= x >> 27
+        self._rng64 = x
+        return x * <uint64_t>2685821657736338717
+
+    cdef inline void _sample_mu_double(self, Py_ssize_t row, Py_ssize_t col) noexcept:
+        cdef uint64_t bits = self._next64() >> 11
+        cdef double u = <double>bits * (1.0 / 9007199254740992.0)
+        self._mud[row*self._n+col] = (u-0.5)*self._deta*2.0
+
+    cdef void _run_double(self, unsigned long long max_swaps,
+                          Py_ssize_t start, Py_ssize_t stop) except *:
+        cdef Py_ssize_t i = start, n = self._n
+        cdef double left, right, old, new, mui, next_r
+        while i < stop-1:
+            self.tests += 1
+            mui = self._mud[(i+1)*n+i]
+            if self._siegel:
+                left = self._dsiegel_coeff*self._rd[i]
+                right = self._rd[i+1]
+            else:
+                left = self._ddelta*self._rd[i]
+                right = self._rd[i+1] + mui*mui*self._rd[i]
+            if left <= right:
+                i += 1
+                continue
+            if self.swaps_last_block >= max_swaps:
+                raise RuntimeError(f'max_swaps={max_swaps} reached; state preserved')
+            if self._trace_swaps:
+                self._valid_swap_mu.append(repr(mui))
+            old = self._rd[i]
+            next_r = self._rd[i+1]
+            new = next_r + mui*mui*old
+            if not isfinite(new) or not (new > 0.0):
+                raise ArithmeticError(f'bad GSO diagonal after swap at {i}')
+            self._rd[i+1] = (old*next_r)/new
+            self._rd[i] = new
+            if not isfinite(self._rd[i+1]) or not (self._rd[i+1] > 0.0):
+                raise ArithmeticError(f'bad GSO diagonal after swap at {i+1}')
+            self.swaps += 1
+            self.swaps_last_block += 1
+            self._sample_mu_double(i+1,i)
+            if i > start:
+                self._sample_mu_double(i,i-1)
+            if i+1 < stop-1:
+                self._sample_mu_double(i+2,i+1)
+            if i > start:
+                i -= 1
 
     cdef void _parse(self, mpfr_t out, object value) except *:
         # Avoid float() on full-precision input; cast using its printed value.
@@ -306,10 +449,13 @@ cdef class SandpileSeq:
             raise ValueError('require 0 <= start < kappa <= n')
         for row in range(stop, self._n):
             for col in range(start, stop):
-                self._sample_mu_entry(row, col)
+                if self._fptype == 'double':
+                    self._sample_mu_double(row, col)
+                else:
+                    self._sample_mu_entry(row, col)
         return self
 
-    def run(self, unsigned long long max_swaps=1000000, *,
+    def run(self, unsigned long long max_swaps=0x400000000, *,
             Py_ssize_t start=0, kappa=None):
         """Simulate only [start,kappa); never mutate coefficients outside.
 
@@ -324,6 +470,9 @@ cdef class SandpileSeq:
         if not (0 <= start < stop <= n):
             raise ValueError('require 0 <= start < kappa <= n')
         self.swaps_last_block = 0
+        if self._fptype == 'double':
+            self._run_double(max_swaps, start, stop)
+            return self
         i = start
         while i < stop-1:
             self.tests += 1
@@ -344,7 +493,8 @@ cdef class SandpileSeq:
             # Collect the size-reduced mu IMMEDIATELY before a valid swap.
             # TODO: replace uniform re-sampling with a distribution conditional
             # on the event that the subsequent swap is valid (user-requested).
-            self._valid_swap_mu.append(_decimal(self._mu[(i+1)*n+i]))
+            if self._trace_swaps:
+                self._valid_swap_mu.append(_decimal(self._mu[(i+1)*n+i]))
 
             # Exact same algebra as Sandpile_Model_Seq in uploaded C++:
             #   temp = r[i+1]
@@ -378,6 +528,10 @@ cdef class SandpileSeq:
         return self._n
 
     @property
+    def fptype(self):
+        return self._fptype
+
+    @property
     def precision(self):
         return self._prec
 
@@ -387,11 +541,15 @@ cdef class SandpileSeq:
 
     def profile(self):
         """Squared GS profile, as exact MPFR round-trip decimal strings."""
+        if self._fptype == 'double':
+            return [repr(self._rd[i]) for i in range(self._n)]
         return [_decimal(self._r[i]) for i in range(self._n)]
 
     def mu_matrix(self):
         """Full lower triangular mu matrix, decimal strings."""
         cdef Py_ssize_t i, j, n = self._n
+        if self._fptype == 'double':
+            return [[repr(self._mud[i*n+j]) for j in range(n)] for i in range(n)]
         return [[_decimal(self._mu[i*n+j]) for j in range(n)]
                 for i in range(n)]
 
@@ -402,6 +560,8 @@ cdef class SandpileSeq:
     def final_subdiagonal_mu(self):
         """All mu[i+1,i] at the current state, in MPFR decimal strings."""
         cdef Py_ssize_t i, n = self._n
+        if self._fptype == 'double':
+            return [repr(self._mud[(i+1)*n+i]) for i in range(n-1)]
         return [_decimal(self._mu[(i+1)*n+i]) for i in range(n-1)]
 
     def snapshot(self):
@@ -409,6 +569,8 @@ cdef class SandpileSeq:
             'r': self.profile(),
             'mu': self.mu_matrix(),
             'precision': self._prec,
+            'fptype': self._fptype,
+            'trace_swaps': bool(self._trace_swaps),
             'condition': self.condition,
             'swaps': int(self.swaps),
             'swaps_last_block': int(self.swaps_last_block),
