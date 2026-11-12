@@ -74,7 +74,7 @@ cdef class SandpileSeq:
     cdef mpfr_t _delta, _eta, _siegel_coeff, _half, _lhs, _rhs, _tmp, _old_r, _new_r
     cdef bint _scalar_init, _rng_init, _siegel
     cdef gmp_randstate_t _rng
-    cdef public unsigned long long swaps, tests
+    cdef public unsigned long long swaps, swaps_last_block, tests
     cdef object _valid_swap_mu
 
     def __cinit__(self):
@@ -85,7 +85,8 @@ cdef class SandpileSeq:
         self._mu_init = 0
         self._scalar_init = False
         self._rng_init = False
-        self.swaps = self.tests = 0
+        self.swaps = self.swaps_last_block = 0
+        self.tests = 0
         self._valid_swap_mu = []
 
     def __dealloc__(self):
@@ -277,19 +278,54 @@ cdef class SandpileSeq:
                 d = M.get_mu(i, j)
                 mpfr_set_d(self._mu[i*n+j], d, MPFR_RNDN)
 
-    cdef void _sample_subdiag(self, Py_ssize_t i) noexcept:
-        """Uniform (-eta, eta), sampled in native MPFR precision."""
-        cdef mpfr_t* x = &self._mu[(i+1)*self._n+i]
+    cdef void _sample_mu_entry(self, Py_ssize_t row, Py_ssize_t col) noexcept:
+        """Uniform (-eta, eta), sampled directly into a native MPFR entry."""
+        cdef mpfr_t* x = &self._mu[row*self._n+col]
         mpfr_urandomb(x[0], self._rng)
         mpfr_sub(x[0], x[0], self._half, MPFR_RNDN)
         mpfr_mul(x[0], x[0], self._eta, MPFR_RNDN)
         mpfr_mul_ui(x[0], x[0], 2, MPFR_RNDN)
 
-    def run(self, unsigned long long max_swaps=1000000):
-        """Execute sequential sweep to termination (or max_swaps), in place."""
-        cdef Py_ssize_t i = 0
-        cdef Py_ssize_t n = self._n
-        while i < n-1:
+    cdef void _sample_subdiag(self, Py_ssize_t i) noexcept:
+        """Resample mu[i+1,i] (caller validates that it is in the window)."""
+        self._sample_mu_entry(i+1, i)
+
+    def resample_external_mu(self, Py_ssize_t start=0, kappa=None):
+        """Separately resample mu[row,col] for row>=kappa, start<=col<kappa.
+
+        This is an independent stochastic approximation to downstream GSO
+        coefficient propagation, not an exact basis/GSO transformation.
+        Neither profile nor any other mu coefficient is altered.
+        """
+        cdef Py_ssize_t stop, row, col
+        if kappa is None:
+            stop = self._n
+        else:
+            stop = <Py_ssize_t>kappa
+        if not (0 <= start < stop <= self._n):
+            raise ValueError('require 0 <= start < kappa <= n')
+        for row in range(stop, self._n):
+            for col in range(start, stop):
+                self._sample_mu_entry(row, col)
+        return self
+
+    def run(self, unsigned long long max_swaps=1000000, *,
+            Py_ssize_t start=0, kappa=None):
+        """Simulate only [start,kappa); never mutate coefficients outside.
+
+        swaps is cumulative; swaps_last_block counts the current invocation.
+        max_swaps applies per invocation (even across repeated block calls).
+        """
+        cdef Py_ssize_t stop, i, n = self._n
+        if kappa is None:
+            stop = n
+        else:
+            stop = <Py_ssize_t>kappa
+        if not (0 <= start < stop <= n):
+            raise ValueError('require 0 <= start < kappa <= n')
+        self.swaps_last_block = 0
+        i = start
+        while i < stop-1:
             self.tests += 1
             if self._siegel:
                 mpfr_mul(self._lhs, self._siegel_coeff, self._r[i], MPFR_RNDN)
@@ -302,7 +338,7 @@ cdef class SandpileSeq:
             if mpfr_cmp(self._lhs, self._rhs) <= 0:
                 i += 1
                 continue
-            if self.swaps >= max_swaps:
+            if self.swaps_last_block >= max_swaps:
                 raise RuntimeError(f'max_swaps={max_swaps} reached; state preserved')
 
             # Collect the size-reduced mu IMMEDIATELY before a valid swap.
@@ -325,14 +361,15 @@ cdef class SandpileSeq:
             mpfr_div(self._r[i+1], self._tmp, self._new_r, MPFR_RNDN)
             mpfr_set(self._r[i], self._new_r, MPFR_RNDN)
             self.swaps += 1
+            self.swaps_last_block += 1
 
             # Original stochastic rule, unchanged; full mu matrix is RETAINED.
             self._sample_subdiag(i)
-            if i > 0:
+            if i > start:
                 self._sample_subdiag(i-1)
-            if i+1 < n-1:
+            if i+1 < stop-1:
                 self._sample_subdiag(i+1)
-            if i > 0:
+            if i > start:
                 i -= 1
         return self
 
@@ -374,6 +411,7 @@ cdef class SandpileSeq:
             'precision': self._prec,
             'condition': self.condition,
             'swaps': int(self.swaps),
+            'swaps_last_block': int(self.swaps_last_block),
             'tests': int(self.tests),
             'valid_swap_mu': self.valid_swap_mu(),
             'final_subdiagonal_mu': self.final_subdiagonal_mu(),
