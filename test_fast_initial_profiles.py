@@ -63,17 +63,21 @@ FAMILIES = {
         "dimension": n,
         "q_bits": 14.2 * n / 128,   # uncalibrated heuristic
         "count": 20,
-        "precisions": (103, 206, 412) if n in (128, 256) else (206,),
+        # (fptype, precision): precision is meaningful ONLY for MPFR.
+        # Native double is represented with precision=None.
+        "backends": (("mpfr", 103), ("mpfr", 206), ("mpfr", 412),
+                     ("double", None)) if n in (128, 256)
+                    else (("double", None),),
         "conditions": ("lovasz", "siegel"),
     }
     for n in (128, 256, 512, 768, 1024)
 }
 
 RAW_FIELDS = ("case_id", "family", "dimension", "instance", "seed", "condition",
-              "precision", "q_bits", "q", "delta", "eta", "max_swaps",
+              "fptype", "precision", "q_bits", "q", "delta", "eta", "max_swaps",
               "generation_seconds", "simulation_seconds", "total_seconds",
               "swaps", "tests", "swap_limit_hit", "error")
-SUMMARY_FIELDS = ("family", "dimension", "condition", "precision", "n_ok",
+SUMMARY_FIELDS = ("family", "dimension", "condition", "fptype", "precision", "n_ok",
                   "n_error", "n_limit_hit", "runtime_median_s", "runtime_variance_s2",
                   "swaps_median", "swaps_variance", "generation_median_s",
                   "total_walltime_s", "simulation_walltime_s")
@@ -92,7 +96,7 @@ def ntru_circulant_proxy(case, *, delta, eta):
     d = n // 2
     if n % 2:
         raise ValueError("NTRU proxy requires an even ambient dimension")
-    prec = case["precision"]
+    prec = case["precision"] if case["fptype"] == "mpfr" else 53
     with mp.workprec(max(128, prec + 48)):
         q = int(mp.ceil(mp.power(2, mp.mpf(str(case["q_bits"])))))
         digits = int(prec * 0.30103) + 12
@@ -107,7 +111,8 @@ def ntru_circulant_proxy(case, *, delta, eta):
             row[j] = ratios[(j-i) % d]
     sim = SandpileSeq((([str(q*q)]*d)+(["1"]*d), mu),
                      condition=case["condition"], delta=delta, eta=eta,
-                     precision=prec, seed=case["seed"])
+                     precision=case["precision"], fptype=case["fptype"],
+                     seed=case["seed"], trace_swaps=False)
     return sim, q
 
 
@@ -132,10 +137,11 @@ def cases_for_families(families=FAMILIES, *, base_seed=1729,
             seed = int.from_bytes(hashlib.sha256(
                 f"{base_seed}/{name}/{j}".encode()).digest()[:4], 'big')
             for condition in cfg["conditions"]:
-                for prec in cfg["precisions"]:
+                for fptype, prec in cfg["backends"]:
                     base = dict(family=name, factory=cfg["factory"],
                                 dimension=cfg["dimension"], instance=j,
-                                seed=seed, condition=condition, precision=prec,
+                                seed=seed, condition=condition,
+                                fptype=fptype, precision=prec,
                                 q_bits=cfg["q_bits"], delta=delta, eta=eta,
                                 max_swaps=max_swaps)
                     # A content-addressed ID prevents accidental reuse after
@@ -169,16 +175,18 @@ def _stat(values, fn):
 
 
 def summarize(rows, cases):
-    """Per-family + condition + precision median/variance over lattice seeds."""
+    """Per-family + condition + backend + precision stats over lattice seeds."""
     ids = {c["case_id"] for c in cases}
     by_key = defaultdict(dict)
     for r in rows:
         if r.get("case_id") in ids:
-            key = (r["family"], int(r["dimension"]), r["condition"], int(r["precision"]))
+            key = (r["family"], int(r["dimension"]), r["condition"],
+                   r["fptype"], int(r["precision"]) if r["precision"] else None)
             by_key[key][r["case_id"]] = r  # latest attempt wins
     inventory = defaultdict(list)
     for c in cases:
-        inventory[(c["family"], c["dimension"], c["condition"], c["precision"])].append(c)
+        inventory[(c["family"], c["dimension"], c["condition"],
+                   c["fptype"], c["precision"])].append(c)
     result = []
     for key, listed in inventory.items():
         attempts = by_key.get(key, {})
@@ -189,7 +197,7 @@ def summarize(rows, cases):
         def median(x): return statistics.median(x) if x else float('nan')
         def var(x): return statistics.variance(x) if len(x)>1 else (0.0 if x else float('nan'))
         result.append(dict(zip(SUMMARY_FIELDS, (
-            key[0], key[1], key[2], key[3], len(successful),
+            key[0], key[1], key[2], key[3], key[4], len(successful),
             len(attempts)-len(successful),
             sum(int(r["swap_limit_hit"]) for r in successful),
             median(times), var(times), median(swaps), var(swaps),
@@ -198,7 +206,8 @@ def summarize(rows, cases):
             sum(_num(r["simulation_seconds"]) for r in attempts.values()
                 if r["simulation_seconds"]),
         ))))
-    return sorted(result, key=lambda x: (x["dimension"], x["condition"], x["precision"]))
+    return sorted(result, key=lambda x: (x["dimension"], x["condition"],
+                                               x["fptype"], x["precision"] or 0))
 
 
 def write_summary(path, groups):
@@ -211,12 +220,13 @@ def write_summary(path, groups):
 
 def print_summary(groups, *, wall_seconds=None):
     print("\nPer-family simulation statistics (sample variance, n-1):")
-    print(f"{'Family':<12} {'Condition':<8} {'p':>4} {'ok':>4} {'err':>3} "
+    print(f"{'Family':<12} {'Condition':<8} {'type':<7} {'p':>4} {'ok':>4} {'err':>3} "
           f"{'limit':>5} {'med s':>12} {'var s^2':>14} {'med swaps':>14} {'var swaps':>17} {'wall s':>12}")
     for g in groups:
         def fmt(v):
             return f"{v:.5g}" if isinstance(v, (float,int)) and math.isfinite(v) else 'n/a'
-        print(f"{g['family']:<12} {g['condition']:<8} {g['precision']:>4} "
+        print(f"{g['family']:<12} {g['condition']:<8} {g['fptype']:<7} "
+              f"{str(g['precision'] or '-'):>4} "
               f"{g['n_ok']:>4} {g['n_error']:>3} {g['n_limit_hit']:>5} "
               f"{fmt(g['runtime_median_s']):>12} {fmt(g['runtime_variance_s2']):>14} "
               f"{fmt(g['swaps_median']):>14} {fmt(g['swaps_variance']):>17} "
@@ -228,7 +238,7 @@ def print_summary(groups, *, wall_seconds=None):
 
 
 def run_benchmarks(cases, *, output, resume=True, report=None):
-    """Actually execute both simulator conditions and record individual results."""
+    """Execute both conditions for every configured backend, recording all runs."""
     output = Path(output)
     output.parent.mkdir(parents=True, exist_ok=True)
     existing = _read_rows(output) if resume else []
@@ -249,7 +259,7 @@ def run_benchmarks(cases, *, output, resume=True, report=None):
                      total_seconds='', swaps='', tests='', swap_limit_hit='', error='')
             t0 = time.perf_counter()
             print(f"[{ix}/{len(cases)}] {c['family']} #{c['instance']:02d} "
-                  f"{c['condition']} p={c['precision']}", flush=True)
+                  f"{c['condition']} {c['fptype']} p={c['precision'] or '-'}", flush=True)
             try:
                 sim, q = PROFILE_FACTORIES[c['factory']](
                     c, delta=c['delta'], eta=c['eta'])
@@ -282,7 +292,7 @@ def run_benchmarks(cases, *, output, resume=True, report=None):
 
 
 def cli(argv=None):
-    parser = argparse.ArgumentParser(description="LLL-SP Lovasz/Siegel benchmark")
+    parser = argparse.ArgumentParser(description="LLL-SP Lovasz/Siegel benchmark (MPFR/double)")
     actions = parser.add_mutually_exclusive_group()
     actions.add_argument('--bench', action='store_true', help='execute simulations')
     actions.add_argument('--list', action='store_true', help='print JSON experiment inventory')
@@ -291,7 +301,8 @@ def cli(argv=None):
     parser.add_argument('--count', type=int, default=None,
                         help='override instances per family (default 20)')
     parser.add_argument('--seed', type=int, default=1729)
-    parser.add_argument('--max-swaps', type=int, default=0x400000000)
+    parser.add_argument('--max-swaps', type=lambda x: int(x, 0), default=1_000_000,
+                        help="swap limit, decimal or e.g. 0x400000000")
     parser.add_argument('--delta', type=float, default=0.99)
     parser.add_argument('--eta', type=float, default=0.51)
     parser.add_argument('--output', default='ntru_sp_benchmark.csv')
