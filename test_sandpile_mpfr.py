@@ -11,8 +11,24 @@ def test_conditions():
     data=(['100','69.5'],mu)
     # Lovasz threshold: (0.95-0.25)*100 = 70
     # Siegel threshold: (0.95-0.51^2)*100 = 68.99
-    lovasz=SandpileSeq(data,precision=212,condition='lovasz',delta=0.95,eta=0.51,seed=1)
-    siegel=SandpileSeq(data,precision=212,condition='siegel',delta=0.95,eta=0.51,seed=1)
+    lovasz=SandpileSeq(
+        data,
+        precision=212,
+        condition='lovasz',
+        delta=0.95,
+        eta=0.51,
+        seed=1,
+        trace_swaps=True,
+    )
+    siegel=SandpileSeq(
+        data,
+        precision=212,
+        condition='siegel',
+        delta=0.95,
+        eta=0.51,
+        seed=1,
+        trace_swaps=True,
+    )
     lovasz.run(max_swaps=100)
     siegel.run(max_swaps=100)
     assert lovasz.swaps >= 1

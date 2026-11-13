@@ -22,6 +22,30 @@ from libc.math cimport isfinite
 
 from fpylll.fplll.gso cimport MatGSO
 from fpylll.fplll.decl cimport mat_gso_mpz_mpfr, mat_gso_long_mpfr
+from fpylll.fplll.decl cimport (
+    dd_t, qd_t, mat_gso_mpz_dd, mat_gso_long_dd,
+    mat_gso_mpz_qd, mat_gso_long_qd,
+)
+from libcpp.string cimport string
+from libcpp.vector cimport vector
+from libc.stdint cimport uint64_t
+
+cdef extern from "sandpile_qd_core.hpp" namespace "lllsp":
+    cdef cppclass QDCore:
+        void set_r_dd(size_t, const dd_t&) except +
+        void set_mu_dd(size_t, size_t, const dd_t&) except +
+        void set_r_qd(size_t, const qd_t&) except +
+        void set_mu_qd(size_t, size_t, const qd_t&) except +
+        void set_r_string(size_t, const string&) except +
+        void set_mu_string(size_t, size_t, const string&) except +
+        string r_string(size_t) except +
+        string mu_string(size_t, size_t) except +
+        void run(uint64_t, size_t, size_t, bint, vector[string]&, uint64_t&, uint64_t&) except +
+        void resample_external(size_t, size_t) except +
+        void check() except +
+    QDCore* make_dd(size_t, double, double, bint, uint64_t) except +
+    QDCore* make_qd(size_t, double, double, bint, uint64_t) except +
+
 from fpylll.fplll.fplll cimport FP_NR
 from fpylll.mpfr.mpfr cimport (
     mpfr_t, mp_prec_t, mp_exp_t, MPFR_RNDN,
@@ -69,6 +93,7 @@ cdef class SandpileSeq:
     *current* uniform sampler (alternative sampler is a future TODO).
     `run` can be called repeatedly. `snapshot()` exports full-precision strings.
     """
+    cdef QDCore* _qdcore
     cdef double* _rd
     cdef double* _mud
     cdef double _ddelta, _deta, _dsiegel_coeff
@@ -86,6 +111,7 @@ cdef class SandpileSeq:
     cdef object _valid_swap_mu
 
     def __cinit__(self):
+        self._qdcore = NULL
         self._rd = NULL
         self._mud = NULL
         self._fptype = 'mpfr'
@@ -103,6 +129,10 @@ cdef class SandpileSeq:
         self._valid_swap_mu = []
 
     def __dealloc__(self):
+        if self._qdcore != NULL:
+            del self._qdcore
+            self._qdcore = NULL
+
         cdef Py_ssize_t j
         if self._rd != NULL:
             free(self._rd)
@@ -148,12 +178,13 @@ cdef class SandpileSeq:
         if condition not in ('lovasz', 'siegel'):
             raise ValueError("condition must be 'lovasz' or 'siegel'")
         self._siegel = condition == 'siegel'
-        if fptype not in ('double', 'dd', 'mpfr'):
-            raise ValueError("fptype must be 'double', 'dd', or 'mpfr'")
+        if fptype not in ('double', 'dd', 'qd', 'mpfr'):
+            raise ValueError("fptype must be 'double', 'dd', 'qd', or 'mpfr'")
         self._fptype = fptype
         self._trace_swaps = bool(trace_swaps)
-        if fptype == 'dd':
-            raise NotImplementedError('dd backend is reserved, not implemented')
+        if fptype in ('dd', 'qd'):
+            self._init_qd(source, delta, eta, seed)
+            return
         # A native-double instance does not allocate MPFR arrays or initialize
         # MPFR temporaries. precision is deliberately ignored for non-MPFR.
         if fptype == 'double':
@@ -242,6 +273,73 @@ cdef class SandpileSeq:
         for i in range(n*n):
             if not mpfr_number_p(self._mu[i]):
                 raise ArithmeticError(f'nonfinite mu matrix entry at {i//n}, {i%n}')
+
+    cdef void _init_qd(self, object source, object delta, object eta, object seed) except *:
+        cdef Py_ssize_t n, i, j
+        cdef MatGSO M
+        cdef FP_NR[dd_t] td
+        cdef FP_NR[qd_t] tq
+        cdef bint from_gso = isinstance(source, MatGSO)
+        cdef bint dd = self._fptype == 'dd'
+        cdef int typ
+        if int(seed) < 0:
+            raise ValueError('seed must be >= 0')
+        if from_gso:
+            M = <MatGSO>source
+            typ = M._type
+            if dd and typ not in (mat_gso_mpz_dd, mat_gso_long_dd):
+                raise TypeError('dd requires a native float_type="dd" GSO')
+            if not dd and typ not in (mat_gso_mpz_qd, mat_gso_long_qd):
+                raise TypeError('qd requires a native float_type="qd" GSO')
+            n = M.B.nrows
+        else:
+            if not isinstance(source, (tuple, list)) or len(source) != 2:
+                raise TypeError('source must be a native matching GSO or (profile, mu)')
+            n = len(source[0])
+        if n < 2:
+            raise ValueError('dimension must be >= 2')
+        self._n = n
+        self._prec = 106 if dd else 212
+        self._qdcore = (make_dd(n, float(delta), float(eta), self._siegel, <uint64_t>int(seed))
+                        if dd else make_qd(n, float(delta), float(eta), self._siegel,
+                                           <uint64_t>int(seed)))
+        if from_gso:
+            if not M.update_gso():
+                raise ArithmeticError('MatGSO.update_gso() failed')
+            for i in range(n):
+                if dd:
+                    if typ == mat_gso_mpz_dd:
+                        M._core.mpz_dd.get_r(td, <int>i, <int>i)
+                    else:
+                        M._core.long_dd.get_r(td, <int>i, <int>i)
+                    self._qdcore.set_r_dd(i, td.get_data())
+                else:
+                    if typ == mat_gso_mpz_qd:
+                        M._core.mpz_qd.get_r(tq, <int>i, <int>i)
+                    else:
+                        M._core.long_qd.get_r(tq, <int>i, <int>i)
+                    self._qdcore.set_r_qd(i, tq.get_data())
+                for j in range(i):
+                    if dd:
+                        if typ == mat_gso_mpz_dd:
+                            M._core.mpz_dd.get_mu(td, <int>i, <int>j)
+                        else:
+                            M._core.long_dd.get_mu(td, <int>i, <int>j)
+                        self._qdcore.set_mu_dd(i, j, td.get_data())
+                    else:
+                        if typ == mat_gso_mpz_qd:
+                            M._core.mpz_qd.get_mu(tq, <int>i, <int>j)
+                        else:
+                            M._core.long_qd.get_mu(tq, <int>i, <int>j)
+                        self._qdcore.set_mu_qd(i, j, tq.get_data())
+        else:
+            for i in range(n):
+                self._qdcore.set_r_string(i, str(source[0][i]).encode('ascii'))
+                if source[1] is not None:
+                    for j in range(i):
+                        self._qdcore.set_mu_string(i, j,
+                            str(_matrix_get(source[1], i, j)).encode('ascii'))
+        self._qdcore.check()
 
     cdef void _init_double(self, object source, object delta, object eta,
                            object seed, bint allow_lossy_gso) except *:
@@ -447,6 +545,10 @@ cdef class SandpileSeq:
             stop = <Py_ssize_t>kappa
         if not (0 <= start < stop <= self._n):
             raise ValueError('require 0 <= start < kappa <= n')
+        if self._fptype in ('dd', 'qd'):
+            self._qdcore.resample_external(start, stop)
+            return self
+
         for row in range(stop, self._n):
             for col in range(start, stop):
                 if self._fptype == 'double':
@@ -470,6 +572,20 @@ cdef class SandpileSeq:
         if not (0 <= start < stop <= n):
             raise ValueError('require 0 <= start < kappa <= n')
         self.swaps_last_block = 0
+        cdef vector[string] qd_trace
+        cdef uint64_t qd_tests = 0
+        cdef uint64_t qd_swaps = 0
+        if self._fptype in ('dd', 'qd'):
+            try:
+                self._qdcore.run(max_swaps, start, stop,
+                                 self._trace_swaps, qd_trace, qd_tests, qd_swaps)
+            finally:
+                self.tests += qd_tests
+                self.swaps_last_block = qd_swaps
+                self.swaps += qd_swaps
+                for v in qd_trace:
+                    self._valid_swap_mu.append((<bytes>v).decode('ascii'))
+            return self
         if self._fptype == 'double':
             self._run_double(max_swaps, start, stop)
             return self
@@ -543,6 +659,9 @@ cdef class SandpileSeq:
         """Squared GS profile, as exact MPFR round-trip decimal strings."""
         if self._fptype == 'double':
             return [repr(self._rd[i]) for i in range(self._n)]
+        if self._fptype in ('dd', 'qd'):
+            return [(<bytes>self._qdcore.r_string(i)).decode('ascii')
+                    for i in range(self._n)]
         return [_decimal(self._r[i]) for i in range(self._n)]
 
     def mu_matrix(self):
@@ -550,6 +669,9 @@ cdef class SandpileSeq:
         cdef Py_ssize_t i, j, n = self._n
         if self._fptype == 'double':
             return [[repr(self._mud[i*n+j]) for j in range(n)] for i in range(n)]
+        if self._fptype in ('dd', 'qd'):
+            return [[(<bytes>self._qdcore.mu_string(i, j)).decode('ascii')
+                     for j in range(n)] for i in range(n)]
         return [[_decimal(self._mu[i*n+j]) for j in range(n)]
                 for i in range(n)]
 
@@ -562,6 +684,9 @@ cdef class SandpileSeq:
         cdef Py_ssize_t i, n = self._n
         if self._fptype == 'double':
             return [repr(self._mud[(i+1)*n+i]) for i in range(n-1)]
+        if self._fptype in ('dd', 'qd'):
+            return [(<bytes>self._qdcore.mu_string(i+1, i)).decode('ascii')
+                    for i in range(n-1)]
         return [_decimal(self._mu[(i+1)*n+i]) for i in range(n-1)]
 
     def snapshot(self):

@@ -70,6 +70,9 @@ cfg_dir.mkdir(parents=True, exist_ok=True)
 )
 include_overlay = str(cfg_dir.parent)
 
+if not fpylll_config.have_qd:
+    raise RuntimeError('This patch requires fpylll/fplll compiled with QD support')
+
 print(f'[sandpile] Python: {sys.executable}')
 print(f'[sandpile] fpylll: {getattr(fpylll, "__version__", "unknown")}')
 print(f'[sandpile] Cython: {cython_version}')
@@ -79,7 +82,7 @@ ext = Extension(
     'sandpile_mpfr',
     sources=['sandpile_mpfr.pyx'],
     language='c++',
-    libraries=['fplll', 'mpfr', 'gmp'],
+    libraries=['fplll', 'mpfr', 'gmp', 'qd'],
     include_dirs=[str(Path(sys.prefix) / 'include')],
     library_dirs=[str(Path(sys.prefix) / 'lib')],
     extra_compile_args=['-O3', '-std=c++11'],
