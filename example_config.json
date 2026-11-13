@@ -9,11 +9,51 @@
   "trace_real_swaps": true,
   "families": {
     "ntru": [
-      {"count": 5, "degree": 80, "q": 18839, "sigma": 20.0},
-      {"count": 5, "degree": 100, "q": 18839, "sigma": 20.0}
+      {
+        "count": 5,
+        "degree": 80,
+        "q": 18839,
+        "sigma": 20.0,
+        "fptype": "mpfr",
+        "precision": 128
+      },
+      {
+        "count": 5,
+        "degree": 100,
+        "q": 18839,
+        "sigma": 20.0,
+        "fptype": "mpfr",
+        "precision": 128
+      }
     ],
     "qary": [
-      {"count": 5, "dimension": 128, "bits": 13, "k": 64}
+      {
+        "count": 5,
+        "dimension": 128,
+        "bits": 13,
+        "k": 64
+      }
+    ],
+    "intrel": [
+      {
+        "dimension": 96,
+        "bits": 144,
+        "count": 5,
+        "fptype": "mpfr",
+        "precision": 768
+      }
+    ],
+    "coppersmith": [
+      {
+        "degree": 5,
+        "m": 6,
+        "t": 10,
+        "modulus_bits": 34,
+        "X": 7,
+        "count": 5,
+        "fptype": "mpfr",
+        "precision": 384
+      }
     ]
   }
 }

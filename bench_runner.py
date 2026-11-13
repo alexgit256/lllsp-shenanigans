@@ -63,58 +63,101 @@ def profile_distance(real_profile, sim_profile, precision):
     }
 
 
-def _mat_gso(B, prec):
+
+def _effective_arithmetic(cfg, spec):
+    """Resolve variant > family defaults > global, independently per worker.
+
+    `precision` refers to MPFR *arithmetic* only; a precision for metrics is
+    supplied independently.  Non-MPFR backends have fixed significand precision.
+    """
+    family=spec['family']
+    variant=spec.get('spec', {})
+    defaults=cfg.get('family_defaults', {}).get(family, {})
+    # Also support a family-level dict with a `variants` array in the future.
+    if not isinstance(defaults, dict) or not isinstance(variant, dict):
+        raise TypeError('family defaults and variant specifications must be objects')
+    def lookup(key, fallback):
+        for scope in (variant, defaults, cfg):
+            if key in scope:
+                return scope[key]
+        return fallback
+    fptype=str(lookup('fptype','mpfr')).lower()
+    if fptype not in ('double','dd','qd','mpfr'):
+        raise ValueError(f'Unsupported fptype={fptype!r} for {spec["id"]}')
+    precision=int(lookup('precision',212)) if fptype=='mpfr' else None
+    if precision is not None and precision < 53:
+        raise ValueError(f'MPFR precision must be at least 53 bits: {precision}')
+    analysis_precision=int(lookup('analysis_precision',max(212,precision or 212)))
+    if analysis_precision < 64:
+        raise ValueError('analysis_precision must be >=64')
+    return {'fptype':fptype,'precision':precision,'analysis_precision':analysis_precision}
+
+
+def _same_arithmetic(record, arithmetic):
+    """Old MPFR records have no fptype field, so do not silently reuse them."""
+    return (record.get('fptype') == arithmetic['fptype']
+            and record.get('precision') == arithmetic['precision']
+            and record.get('analysis_precision') == arithmetic['analysis_precision'])
+
+def _mat_gso(B, prec, fptype='mpfr'):
     from fpylll import GSO, FPLLL
-    FPLLL.set_precision(int(prec))
-    M = GSO.Mat(B, float_type='mpfr')
+    if fptype == 'mpfr':
+        FPLLL.set_precision(int(prec))
+    M=GSO.Mat(B, float_type=fptype)
     if not M.update_gso():
-        raise ArithmeticError('initial GSO update failed')
+        raise ArithmeticError(f'GSO update failed for fptype={fptype}')
     return M
 
 
-def _snapshot(M, delta, eta):
+
+def _snapshot(M, delta, eta, fptype='mpfr', prec=None):
     from sandpile_mpfr import SandpileSeq
-    s = SandpileSeq(M, condition='lovasz', delta=delta, eta=eta,
-                    allow_lossy_gso=False)
-    return {'r': s.profile(), 'mu': s.mu_matrix(),
-            'subdiag_mu': s.final_subdiagonal_mu()}
+    kw={'fptype':fptype,'condition':'lovasz','delta':delta,'eta':eta,
+        'allow_lossy_gso':False}
+    if fptype=='mpfr':
+        kw['precision']=int(prec)
+    s=SandpileSeq(M,**kw)
+    return {'r':s.profile(),'mu':s.mu_matrix(),
+            'subdiag_mu':s.final_subdiagonal_mu()}
 
 
-def _preprocess_size_reduce(B, prec, delta, eta):
+
+def _preprocess_size_reduce(B, prec, delta, eta, fptype='mpfr'):
     from fpylll import IntegerMatrix, LLL
-    A = IntegerMatrix(B)
-    M = _mat_gso(A, prec)
-    reducer = LLL.Reduction(M, delta=float(delta), eta=float(eta))
-    reducer.size_reduction(0, A.nrows, 0)
+    A=IntegerMatrix(B)
+    M=_mat_gso(A,prec,fptype)
+    reducer=LLL.Reduction(M,delta=float(delta),eta=float(eta))
+    reducer.size_reduction(0,A.nrows,0)
     if not M.update_gso():
         raise ArithmeticError('size-reduced input has invalid GSO')
-    # Python-accessible get_mu is 53-bit, sufficient only for this diagnostic.
-    max_mu = max(abs(M.get_mu(i, j)) for i in range(1, A.nrows)
-                 for j in range(i))
-    if max_mu > float(eta) + 1e-6:
+    # get_mu returns a double; suitable ONLY for the coarse size-reduction diagnostic.
+    max_mu=max(abs(M.get_mu(i,j)) for i in range(1,A.nrows) for j in range(i))
+    if max_mu>float(eta)+1e-6:
         raise ArithmeticError(f'input not size reduced: max |mu|={max_mu}, eta={eta}')
     return A
 
 
-def _native_lll(B0, condition, prec, delta, eta):
-    from fpylll import LLL, IntegerMatrix
-    B = IntegerMatrix(B0)
-    M = _mat_gso(B, prec)
-    flags = LLL.SIEGEL if condition == 'siegel' else LLL.DEFAULT
-    L = LLL.Reduction(M, delta=float(delta), eta=float(eta), flags=flags)
-    start = time.perf_counter()
+
+def _native_lll(B0, condition, prec, delta, eta, fptype='mpfr', analysis_precision=None):
+    from fpylll import LLL,IntegerMatrix
+    B=IntegerMatrix(B0)
+    M=_mat_gso(B,prec,fptype)
+    flags=LLL.SIEGEL if condition=='siegel' else LLL.DEFAULT
+    L=LLL.Reduction(M,delta=float(delta),eta=float(eta),flags=flags)
+    start=time.perf_counter()
     L()
-    runtime = time.perf_counter()-start
+    runtime=time.perf_counter()-start
     if not M.update_gso():
         raise ArithmeticError('native LLL GSO update failed')
-    state = _snapshot(M, delta, eta)
-    return {'profile': state['r'], 'mu': state['mu'],
-            'final_subdiagonal_mu': state['subdiag_mu'],
-            'metrics': metrics(state['r'], prec),
-            'swaps': int(L.nswaps), 'runtime_sec': runtime}
+    state=_snapshot(M,delta,eta,fptype,prec)
+    return {'profile':state['r'],'mu':state['mu'],
+            'final_subdiagonal_mu':state['subdiag_mu'],
+            'metrics':metrics(state['r'], analysis_precision or prec or 212),
+            'swaps':int(L.nswaps),'runtime_sec':runtime}
 
 
-def _trace_before_swaps(B0, condition, prec, delta, eta, max_swaps):
+
+def _trace_before_swaps(B0, condition, prec, delta, eta, max_swaps, fptype="mpfr"):
     """Instrumented classical *adjacent* LLL using fpylll size reductions.
 
     fplll's native reducer can differ in insertion/size-reduction scheduling;
@@ -124,7 +167,7 @@ def _trace_before_swaps(B0, condition, prec, delta, eta, max_swaps):
     from fpylll import LLL, IntegerMatrix
     from sandpile_mpfr import gso_mu_entry, gso_swap_is_valid
     B = IntegerMatrix(B0)
-    M = _mat_gso(B, prec)
+    M = _mat_gso(B, prec, fptype)
     L = LLL.Reduction(M, delta=float(delta), eta=float(eta))
     k = 1
     swaps = 0
@@ -163,7 +206,7 @@ def _trace_before_swaps(B0, condition, prec, delta, eta, max_swaps):
             k += 1
     if not M.update_gso():
         raise ArithmeticError('trace final GSO update failed')
-    state = _snapshot(M, delta, eta)
+    state = _snapshot(M, delta, eta, fptype, prec)
     return {
         'source': 'instrumented_adjacent_replay_not_native_callback',
         'valid_swap_mu': valid_mu,
@@ -176,21 +219,24 @@ def _trace_before_swaps(B0, condition, prec, delta, eta, max_swaps):
 
 
 def _simulated_lll(M_initial, condition, prec, delta, eta,
-                   seed, max_swaps):
+                   seed, max_swaps, fptype='mpfr', analysis_precision=None):
     from sandpile_mpfr import SandpileSeq
-    s = SandpileSeq(M_initial, precision=prec, condition=condition,
-                    delta=delta, eta=eta, seed=seed,
-                    allow_lossy_gso=False)
-    start = time.perf_counter()
+    kw={'fptype':fptype, 'condition':condition,'delta':delta,'eta':eta,
+        'seed':seed,'allow_lossy_gso':False, 'trace_swaps':True}
+    if fptype=='mpfr':
+        kw['precision']=int(prec)
+    s=SandpileSeq(M_initial,**kw)
+    start=time.perf_counter()
     s.run(max_swaps=max_swaps)
-    elapsed = time.perf_counter()-start
-    state = s.snapshot()
-    return {'profile': state['r'], 'mu': state['mu'],
-            'valid_swap_mu': state['valid_swap_mu'],
-            'final_subdiagonal_mu': state['final_subdiagonal_mu'],
-            'metrics': metrics(state['r'], prec),
-            'swaps': int(s.swaps), 'tests': int(s.tests),
-            'runtime_sec': elapsed}
+    elapsed=time.perf_counter()-start
+    state=s.snapshot()
+    return {'profile':state['r'],'mu':state['mu'],
+            'valid_swap_mu':state['valid_swap_mu'],
+            'final_subdiagonal_mu':state['final_subdiagonal_mu'],
+            'metrics':metrics(state['r'],analysis_precision or prec or 212),
+            'swaps':int(s.swaps),'tests':int(s.tests),
+            'runtime_sec':elapsed}
+
 
 
 def _run_one(payload):
@@ -201,7 +247,10 @@ def _run_one(payload):
     out.mkdir(parents=True, exist_ok=True)
     try:
         from fpylll import FPLLL
-        prec = int(cfg.get('precision', 212))
+        arithmetic = _effective_arithmetic(cfg, spec)
+        fptype = arithmetic['fptype']
+        prec = arithmetic['precision']
+        analysis_precision = arithmetic['analysis_precision']
         delta = float(cfg.get('delta', 0.99))
         eta = float(cfg.get('eta', 0.51))
         max_swaps = int(cfg.get('max_swaps', 0x400000000))
@@ -209,30 +258,31 @@ def _run_one(payload):
         if n_sims < 1:
             raise ValueError('simulation_seeds_per_lattice must be positive')
         FPLLL.set_threads(1)
-        FPLLL.set_precision(prec)
+        if fptype == 'mpfr':
+            FPLLL.set_precision(prec)
         original = read_json_gz(root/spec['file'])
-        B = _preprocess_size_reduce(from_rows(original['basis']), prec, delta, eta)
+        B = _preprocess_size_reduce(from_rows(original['basis']), prec, delta, eta, fptype)
         write_json_gz(out/'size_reduced_input.json.gz', {
             'instance_id': instance_id, 'basis': matrix_to_rows(B),
-            'delta': delta, 'eta': eta,
+            'delta': delta, 'eta': eta, **arithmetic,
         })
-        M_initial = _mat_gso(B, prec)
-        initial = _snapshot(M_initial, delta, eta)
-        write_json_gz(out/'initial_gso.json.gz', initial)
+        M_initial = _mat_gso(B, prec, fptype)
+        initial = _snapshot(M_initial, delta, eta, fptype, prec)
+        write_json_gz(out/'initial_gso.json.gz', {**initial, **arithmetic})
         output_paths = []
         for condition in ('lovasz', 'siegel'):
-            native = _native_lll(B, condition, prec, delta, eta)
+            native = _native_lll(B, condition, prec, delta, eta, fptype, analysis_precision)
             native.update({'instance_id': instance_id, 'family': spec['family'],
                            'variant': spec['variant'], 'spec': spec['spec'],
                            'algorithm': condition, 'kind': 'real',
-                           'delta': delta, 'eta': eta, 'precision': prec,
+                           'delta': delta, 'eta': eta, **arithmetic,
                            'status': 'finished'})
             if cfg.get('trace_real_swaps', True):
                 try:
                     trace = _trace_before_swaps(B, condition, prec, delta,
-                                                eta, max_swaps)
+                                                eta, max_swaps, fptype)
                     trace['profile_discrepancy'] = profile_distance(
-                        native['profile'], trace['profile'], prec)
+                        native['profile'], trace['profile'], analysis_precision)
                     native['instrumented_trace'] = trace
                 except Exception as exc:
                     native['instrumented_trace'] = {
@@ -248,10 +298,10 @@ def _run_one(payload):
                             + (1 if condition == 'lovasz' else 2)) % (2**31-1)
                 try:
                     sim = _simulated_lll(M_initial, condition, prec, delta, eta,
-                                         sim_seed, max_swaps)
+                                         sim_seed, max_swaps, fptype, analysis_precision)
                     sim['status'] = 'finished'
                     sim['errors'] = profile_distance(native['profile'],
-                                                     sim['profile'], prec)
+                                                     sim['profile'], analysis_precision)
                 except Exception as exc:
                     sim = {'status': 'failed', 'error': repr(exc),
                            'traceback': traceback.format_exc()}
@@ -259,7 +309,7 @@ def _run_one(payload):
                             'family': spec['family'], 'variant': spec['variant'],
                             'spec': spec['spec'], 'algorithm': condition,
                             'kind': 'sim', 'delta': delta, 'eta': eta,
-                            'precision': prec, 'seed': sim_seed})
+                            **arithmetic, 'seed': sim_seed})
                 sim_file = out/f'{condition}_sim_{j:03d}.json.gz'
                 write_json_gz(sim_file, sim)
                 output_paths.append(str(sim_file.relative_to(root)))
@@ -284,6 +334,16 @@ def run_instances(root, workers=None, rerun=False):
         expected += [indir/f'{cond}_sim_{j:03d}.json.gz'
                      for cond in ('lovasz','siegel') for j in range(n_seeds)]
         complete = all(p.exists() for p in expected)
+        if complete:
+            arithmetic = _effective_arithmetic(config, inst)
+            try:
+                for path in expected:
+                    record = read_json_gz(path)
+                    if not _same_arithmetic(record, arithmetic):
+                        complete = False
+                        break
+            except (OSError, ValueError, KeyError):
+                complete = False
         if rerun or not complete:
             jobs.append((str(root), inst, config))
     workers = int(workers or config.get('n_workers', 4))
