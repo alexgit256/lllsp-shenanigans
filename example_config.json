@@ -10,7 +10,7 @@
   "families": {
     "ntru": [
       {
-        "count": 5,
+        "count": 20,
         "degree": 80,
         "q": 18839,
         "sigma": 20.0,
@@ -18,7 +18,7 @@
         "precision": 128
       },
       {
-        "count": 5,
+        "count": 20,
         "degree": 100,
         "q": 18839,
         "sigma": 20.0,
@@ -28,7 +28,7 @@
     ],
     "qary": [
       {
-        "count": 5,
+        "count": 10,
         "dimension": 128,
         "bits": 13,
         "k": 64
@@ -38,7 +38,7 @@
       {
         "dimension": 96,
         "bits": 144,
-        "count": 5,
+        "count": 10,
         "fptype": "mpfr",
         "precision": 768
       }
@@ -50,7 +50,7 @@
         "t": 10,
         "modulus_bits": 34,
         "X": 7,
-        "count": 5,
+        "count": 10,
         "fptype": "mpfr",
         "precision": 384
       }

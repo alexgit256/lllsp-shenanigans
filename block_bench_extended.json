@@ -1,0 +1,80 @@
+{
+  "seed": 42,
+  "delta": 0.95,
+  "eta": 0.51,
+  "conditions": [
+    "lovasz",
+    "siegel"
+  ],
+  "simulation_seeds_per_lattice": 2,
+  "preprocessing_precision": 212,
+  "real": {
+    "float_type": "mpfr",
+    "precision": 212
+  },
+  "simulator": {
+    "fptype": "mpfr",
+    "precision": 212,
+    "resample_external": true,
+    "max_swaps_per_block": 2000000
+  },
+  "limits": {
+    "max_tours": 2,
+    "max_blocks": 250
+  },
+  "families": {
+    "ntru": [
+      {
+        "degree": 8,
+        "q": 257,
+        "sigma": 2.0,
+        "count": 2
+      }
+    ],
+    "qary": [
+      {
+        "dimension": 16,
+        "bits": 8,
+        "k": 8,
+        "count": 2
+      }
+    ]
+  },
+  "schedulers": [
+    {
+      "name": "full",
+      "max_tours": 1
+    },
+    {
+      "name": "nonoverlap",
+      "beta": 8
+    },
+    {
+      "name": "sliding",
+      "beta": 8
+    },
+    {
+      "name": "dyadic",
+      "max_levels": 4
+    },
+    {
+      "name": "flatter",
+      "leaf_size": 8,
+      "max_tours": 1
+    },
+    {
+      "name": "blaster",
+      "beta": 8
+    },
+    {
+      "name": "greedy_lower",
+      "beta": 8,
+      "max_tours": 10
+    },
+    {
+      "name": "greedy_upper",
+      "beta": 8,
+      "max_tours": 10
+    }
+  ]
+}
